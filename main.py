@@ -82,10 +82,11 @@ def summarize(topic, lang, articles):
     lang_name = "Korean" if lang == "ko" else "English"
     prompt = (
         f"You are a tech/finance news editor. Below are recent news headlines about "
-        f"\"{topic}\". Write a concise digest in {lang_name} of the key developments, "
-        f"in your own words.\nRules:\n- STRICTLY under {CHAR_LIMIT} characters.\n"
-        f"- Plain text only, no markdown.\n- 3-5 short sentences. Synthesize; do not "
-        f"copy headlines verbatim.\n\nHeadlines:\n{headlines}"
+        f"\"{topic}\" (they may be in English and/or Korean). Write a concise digest in "
+        f"{lang_name} of the key developments, in your own words.\nRules:\n"
+        f"- STRICTLY under {CHAR_LIMIT} characters.\n- Plain text only, no markdown.\n"
+        f"- 3-5 short sentences. Synthesize; do not copy headlines verbatim.\n\n"
+        f"Headlines:\n{headlines}"
     )
     text = call_gemini(prompt)
     if not text:
@@ -110,12 +111,12 @@ def build_topic_html(topic, emoji, en_sum, ko_sum, links):
     <div style="margin:0 0 26px;padding:18px 20px;border:1px solid #e5e7eb;
                 border-radius:12px;background:#ffffff;">
       <h2 style="margin:0 0 14px;font-size:19px;color:#111827;">{emoji} {html.escape(topic)}</h2>
-      <p style="margin:0 0 4px;font-weight:600;font-size:14px;color:#374151;">🇺🇸 English</p>
-      <p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#1f2937;
-                white-space:pre-wrap;">{html.escape(en_sum)}</p>
       <p style="margin:0 0 4px;font-weight:600;font-size:14px;color:#374151;">🇰🇷 한국어</p>
-      <p style="margin:0;font-size:14px;line-height:1.6;color:#1f2937;
+      <p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#1f2937;
                 white-space:pre-wrap;">{html.escape(ko_sum)}</p>
+      <p style="margin:0 0 4px;font-weight:600;font-size:14px;color:#374151;">🇺🇸 English</p>
+      <p style="margin:0;font-size:14px;line-height:1.6;color:#1f2937;
+                white-space:pre-wrap;">{html.escape(en_sum)}</p>
       {links_html}
     </div>"""
 
@@ -167,8 +168,9 @@ def main():
         print(f"Processing: {topic}")
         en_articles = fetch_articles(gnews_url(en_q, "en"), ARTICLES_PER_FEED)
         ko_articles = fetch_articles(gnews_url(ko_q, "ko"), ARTICLES_PER_FEED)
-        en_sum = summarize(topic, "en", en_articles) or "No recent English articles found."
-        ko_sum = summarize(topic, "ko", ko_articles) or "최근 한국어 기사를 찾지 못했습니다."
+        all_articles = en_articles + ko_articles          # 영문+국문 기사를 합쳐서 요약
+        en_sum = summarize(topic, "en", all_articles) or "No recent articles found."
+        ko_sum = summarize(topic, "ko", all_articles) or "최근 기사를 찾지 못했습니다."
         links = [a["link"] for a in (en_articles[:2] + ko_articles[:2]) if a["link"]]
         sections.append(build_topic_html(topic, emoji, en_sum, ko_sum, links))
         time.sleep(1)
