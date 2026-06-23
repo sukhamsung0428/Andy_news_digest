@@ -57,8 +57,14 @@ def fetch_articles(url, limit):
 def call_gemini(prompt, retries=4):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
-    body = {"contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1024}}
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.4,
+            "maxOutputTokens": 2048,
+            "thinkingConfig": {"thinkingBudget": 0},   # 생각 끄기: 토큰을 요약문에 사용
+        },
+    }
     for attempt in range(retries):
         try:
             r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
@@ -66,7 +72,15 @@ def call_gemini(prompt, retries=4):
                 time.sleep(min(60, 2 ** attempt))
                 continue
             r.raise_for_status()
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            data = r.json()
+            cand = (data.get("candidates") or [{}])[0]
+            parts = (cand.get("content") or {}).get("parts") or []
+            texts = [p.get("text", "") for p in parts if p.get("text")]
+            if texts:
+                return "".join(texts)
+            print(f"  ! Gemini no text (finishReason={cand.get('finishReason')})",
+                  file=sys.stderr)
+            return None
         except Exception as exc:
             if attempt == retries - 1:
                 print(f"  ! Gemini error: {exc}", file=sys.stderr)
