@@ -55,7 +55,7 @@ def fetch_articles(url, limit):
     return items
 
 
-def call_gemini(prompt, retries=3):
+def call_gemini(prompt, retries=6):
     """여러 모델을 순서대로 시도. 성공 시 (text, None), 실패 시 (None, 사유)."""
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
     body = {
@@ -66,19 +66,20 @@ def call_gemini(prompt, retries=3):
             "thinkingConfig": {"thinkingBudget": 0},
         },
     }
+    TRANSIENT = {429, 500, 502, 503, 504}   # 일시적 오류 -> 잠시 쉬고 재시도
     last = "unknown"
     for model in GEMINI_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         for attempt in range(retries):
             try:
                 r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-                if r.status_code == 429:
-                    last = f"{model}: 429 rate-limited"
+                if r.status_code in TRANSIENT:
+                    last = f"{model}: HTTP {r.status_code} (혼잡, 재시도 중)"
                     time.sleep(min(30, 2 ** attempt))
                     continue
                 if not r.ok:
-                    last = f"{model}: HTTP {r.status_code} {r.text[:140]}"
-                    break  # 다음 모델로
+                    last = f"{model}: HTTP {r.status_code} {r.text[:120]}"
+                    break  # 키/권한 등 치명적 오류 -> 다음 모델로
                 data = r.json()
                 cand = (data.get("candidates") or [{}])[0]
                 parts = (cand.get("content") or {}).get("parts") or []
@@ -89,7 +90,7 @@ def call_gemini(prompt, retries=3):
                 break  # 빈 응답 -> 다음 모델로
             except Exception as exc:
                 last = f"{model}: {exc}"
-                time.sleep(2 ** attempt)
+                time.sleep(min(20, 2 ** attempt))
     return None, last
 
 
