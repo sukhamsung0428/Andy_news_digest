@@ -1,39 +1,33 @@
 #!/usr/bin/env python3
-"""
-Daily news digest -> Telegram
-Topics: Physical AI / AI Data Center / Bitcoin
-For each topic it fetches Google News RSS in English AND Korean, asks Gemini
-(free tier) to write a <=800-character summary per language, and posts the
-result to a Telegram chat.
-
-Required environment variables (set them as GitHub Actions secrets):
-  GEMINI_API_KEY       - from Google AI Studio (free)
-  TELEGRAM_BOT_TOKEN   - from @BotFather
-  TELEGRAM_CHAT_ID     - your chat / user id
-"""
+"""Daily news digest -> Email (Physical AI / AI Data Center / Bitcoin)"""
 
 import os
 import sys
+import ssl
 import html
 import time
+import smtplib
 import urllib.parse
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
 from datetime import datetime, timezone, timedelta
 
 import requests
 import feedparser
 
-# ----------------------------- Configuration -----------------------------
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "").strip()
+EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "").strip()
+EMAIL_TO = os.environ.get("EMAIL_TO", "").strip() or EMAIL_ADDRESS
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip() or "smtp.gmail.com"
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465").strip() or "465")
 
-GEMINI_MODEL = "gemini-2.5-flash"   # stable free-tier alias (verified Q2 2026)
-ARTICLES_PER_FEED = 8               # how many recent headlines feed each summary
-CHAR_LIMIT = 800                    # max characters per summary
+GEMINI_MODEL = "gemini-2.5-flash"
+ARTICLES_PER_FEED = 8
+CHAR_LIMIT = 800
 REQUEST_TIMEOUT = 60
 
-# Each topic: (display name, emoji, English query, Korean query)
-# To add/remove topics, just edit this list.
 TOPICS = [
     ("Physical AI",     "🤖", '"Physical AI"',     "피지컬 AI"),
     ("AI Data Center",  "🏢", '"AI data center"',  "AI 데이터센터"),
@@ -43,55 +37,37 @@ TOPICS = [
 KST = timezone(timedelta(hours=9))
 
 
-# ------------------------------- Helpers ---------------------------------
-def gnews_url(query: str, lang: str) -> str:
-    """Build a Google News RSS search URL for a keyword query."""
+def gnews_url(query, lang):
     q = urllib.parse.quote(query)
     if lang == "ko":
         return f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
-def fetch_articles(url: str, limit: int):
-    """Return a list of {title, link, source} dicts from an RSS feed."""
+def fetch_articles(url, limit):
     feed = feedparser.parse(url)
     items = []
     for entry in feed.entries[:limit]:
         title = (entry.get("title") or "").strip()
         link = (entry.get("link") or "").strip()
-        source = ""
-        src = entry.get("source")
-        if isinstance(src, dict):
-            source = src.get("title", "")
-        items.append({"title": title, "link": link, "source": source})
+        items.append({"title": title, "link": link})
     return items
 
 
-def call_gemini(prompt: str, retries: int = 4):
-    """Call Gemini generateContent and return the text, or None on failure."""
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{GEMINI_MODEL}:generateContent"
-    )
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
-    }
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1024},
-    }
+def call_gemini(prompt, retries=4):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.4, "maxOutputTokens": 1024}}
     for attempt in range(retries):
         try:
-            r = requests.post(url, headers=headers, json=body,
-                              timeout=REQUEST_TIMEOUT)
-            if r.status_code == 429:                     # rate limited -> back off
+            r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 429:
                 time.sleep(min(60, 2 ** attempt))
                 continue
             r.raise_for_status()
-            data = r.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as exc:                         # noqa: BLE001
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception as exc:
             if attempt == retries - 1:
                 print(f"  ! Gemini error: {exc}", file=sys.stderr)
                 return None
@@ -99,98 +75,109 @@ def call_gemini(prompt: str, retries: int = 4):
     return None
 
 
-def summarize(topic: str, lang: str, articles: list):
-    """Summarize a topic's headlines into <=CHAR_LIMIT characters."""
+def summarize(topic, lang, articles):
     headlines = "\n".join(f"- {a['title']}" for a in articles if a["title"])
     if not headlines:
         return None
     lang_name = "Korean" if lang == "ko" else "English"
     prompt = (
-        f"You are a tech/finance news editor. Below are recent news headlines "
-        f"about \"{topic}\". Write a concise digest in {lang_name} of the key "
-        f"developments and themes, in your own words.\n"
-        f"Rules:\n"
-        f"- STRICTLY under {CHAR_LIMIT} characters.\n"
-        f"- Plain text only: no markdown, no headers, no bullet symbols.\n"
-        f"- 3-5 short sentences. Synthesize and consolidate; do NOT copy "
-        f"headline wording verbatim.\n"
-        f"- Focus on what is new and why it matters.\n\n"
-        f"Headlines:\n{headlines}"
+        f"You are a tech/finance news editor. Below are recent news headlines about "
+        f"\"{topic}\". Write a concise digest in {lang_name} of the key developments, "
+        f"in your own words.\nRules:\n- STRICTLY under {CHAR_LIMIT} characters.\n"
+        f"- Plain text only, no markdown.\n- 3-5 short sentences. Synthesize; do not "
+        f"copy headlines verbatim.\n\nHeadlines:\n{headlines}"
     )
     text = call_gemini(prompt)
     if not text:
         return None
     text = text.strip()
-    if len(text) > CHAR_LIMIT:                           # hard safety truncate
+    if len(text) > CHAR_LIMIT:
         text = text[:CHAR_LIMIT].rsplit(" ", 1)[0].rstrip() + "…"
     return text
 
 
-def send_telegram(text: str) -> bool:
-    """Send one message to the configured Telegram chat."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
+def build_topic_html(topic, emoji, en_sum, ko_sum, links):
+    links_html = ""
+    if links:
+        items = "".join(
+            f'<li style="margin:2px 0;"><a href="{html.escape(l)}" '
+            f'style="color:#2563eb;text-decoration:none;">{html.escape(l[:70])}…</a></li>'
+            for l in links[:4])
+        links_html = (
+            '<p style="margin:14px 0 4px;font-size:13px;color:#6b7280;">🔗 관련 기사</p>'
+            f'<ul style="margin:0;padding-left:18px;font-size:13px;">{items}</ul>')
+    return f"""
+    <div style="margin:0 0 26px;padding:18px 20px;border:1px solid #e5e7eb;
+                border-radius:12px;background:#ffffff;">
+      <h2 style="margin:0 0 14px;font-size:19px;color:#111827;">{emoji} {html.escape(topic)}</h2>
+      <p style="margin:0 0 4px;font-weight:600;font-size:14px;color:#374151;">🇺🇸 English</p>
+      <p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#1f2937;
+                white-space:pre-wrap;">{html.escape(en_sum)}</p>
+      <p style="margin:0 0 4px;font-weight:600;font-size:14px;color:#374151;">🇰🇷 한국어</p>
+      <p style="margin:0;font-size:14px;line-height:1.6;color:#1f2937;
+                white-space:pre-wrap;">{html.escape(ko_sum)}</p>
+      {links_html}
+    </div>"""
+
+
+def build_email_html(date_str, sections):
+    body = "".join(sections)
+    return f"""<!DOCTYPE html><html><body style="margin:0;padding:0;background:#f3f4f6;">
+    <div style="max-width:680px;margin:0 auto;padding:24px 16px;font-family:
+                -apple-system,'Segoe UI',Roboto,'Apple SD Gothic Neo',sans-serif;">
+      <h1 style="margin:0 0 4px;font-size:22px;color:#111827;">📰 News Digest</h1>
+      <p style="margin:0 0 22px;font-size:14px;color:#6b7280;">{date_str}</p>
+      {body}
+      <p style="margin:8px 0 0;font-size:12px;color:#9ca3af;">
+        자동 생성된 다이제스트 · Physical AI · AI Data Center · Bitcoin</p>
+    </div></body></html>"""
+
+
+def send_email(subject, html_body):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = formataddr(("News Digest", EMAIL_ADDRESS))
+    msg["To"] = EMAIL_TO
+    msg.attach(MIMEText("HTML 메일입니다. HTML 보기를 지원하는 앱에서 열어주세요.", "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
     try:
-        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        if not r.ok:
-            print(f"  ! Telegram {r.status_code}: {r.text}", file=sys.stderr)
-        return r.ok
-    except Exception as exc:                             # noqa: BLE001
-        print(f"  ! Telegram error: {exc}", file=sys.stderr)
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=REQUEST_TIMEOUT) as server:
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.sendmail(EMAIL_ADDRESS, [EMAIL_TO], msg.as_string())
+        return True
+    except Exception as exc:
+        print(f"  ! Email error: {exc}", file=sys.stderr)
         return False
 
 
-def build_message(topic, emoji, date_str, en_sum, ko_sum, links):
-    parts = [
-        f"{emoji} <b>{html.escape(topic)}</b>  ·  {date_str}",
-        "",
-        "🇺🇸 <b>English</b>",
-        html.escape(en_sum),
-        "",
-        "🇰🇷 <b>한국어</b>",
-        html.escape(ko_sum),
-    ]
-    if links:
-        parts += ["", "🔗 " + "  ·  ".join(links[:4])]
-    return "\n".join(parts)
-
-
-# --------------------------------- Main ----------------------------------
 def main():
     missing = [k for k, v in {
         "GEMINI_API_KEY": GEMINI_API_KEY,
-        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+        "EMAIL_ADDRESS": EMAIL_ADDRESS,
+        "EMAIL_APP_PASSWORD": EMAIL_APP_PASSWORD,
     }.items() if not v]
     if missing:
-        print(f"Missing environment variables: {', '.join(missing)}",
-              file=sys.stderr)
+        print(f"Missing environment variables: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
     date_str = datetime.now(KST).strftime("%Y-%m-%d (%a)")
-
+    sections = []
     for topic, emoji, en_q, ko_q in TOPICS:
         print(f"Processing: {topic}")
         en_articles = fetch_articles(gnews_url(en_q, "en"), ARTICLES_PER_FEED)
         ko_articles = fetch_articles(gnews_url(ko_q, "ko"), ARTICLES_PER_FEED)
+        en_sum = summarize(topic, "en", en_articles) or "No recent English articles found."
+        ko_sum = summarize(topic, "ko", ko_articles) or "최근 한국어 기사를 찾지 못했습니다."
+        links = [a["link"] for a in (en_articles[:2] + ko_articles[:2]) if a["link"]]
+        sections.append(build_topic_html(topic, emoji, en_sum, ko_sum, links))
+        time.sleep(1)
 
-        en_sum = summarize(topic, "en", en_articles) \
-            or "No recent English articles found."
-        ko_sum = summarize(topic, "ko", ko_articles) \
-            or "최근 한국어 기사를 찾지 못했습니다."
-
-        links = [a["link"] for a in (en_articles[:2] + ko_articles[:2])
-                 if a["link"]]
-
-        message = build_message(topic, emoji, date_str, en_sum, ko_sum, links)
-        ok = send_telegram(message)
-        print(f"  -> {'sent' if ok else 'FAILED'}")
-        time.sleep(1)                                    # be gentle with the API
+    subject = f"📰 News Digest — {date_str}"
+    ok = send_email(subject, build_email_html(date_str, sections))
+    print(f"-> email {'sent' if ok else 'FAILED'} to {EMAIL_TO}")
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
