@@ -23,7 +23,8 @@ EMAIL_TO = os.environ.get("EMAIL_TO", "").strip() or EMAIL_ADDRESS
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip() or "smtp.gmail.com"
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465").strip() or "465")
 
-GEMINI_MODEL = "gemini-2.5-flash"
+# 첫 모델 실패 시 두 번째 모델로 자동 재시도
+GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 ARTICLES_PER_FEED = 8
 CHAR_LIMIT = 800
 REQUEST_TIMEOUT = 60
@@ -54,45 +55,49 @@ def fetch_articles(url, limit):
     return items
 
 
-def call_gemini(prompt, retries=4):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+def call_gemini(prompt, retries=3):
+    """여러 모델을 순서대로 시도. 성공 시 (text, None), 실패 시 (None, 사유)."""
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.4,
             "maxOutputTokens": 2048,
-            "thinkingConfig": {"thinkingBudget": 0},   # 생각 끄기: 토큰을 요약문에 사용
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
-    for attempt in range(retries):
-        try:
-            r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
-            if r.status_code == 429:
-                time.sleep(min(60, 2 ** attempt))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            cand = (data.get("candidates") or [{}])[0]
-            parts = (cand.get("content") or {}).get("parts") or []
-            texts = [p.get("text", "") for p in parts if p.get("text")]
-            if texts:
-                return "".join(texts)
-            print(f"  ! Gemini no text (finishReason={cand.get('finishReason')})",
-                  file=sys.stderr)
-            return None
-        except Exception as exc:
-            if attempt == retries - 1:
-                print(f"  ! Gemini error: {exc}", file=sys.stderr)
-                return None
-            time.sleep(2 ** attempt)
-    return None
+    last = "unknown"
+    for model in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(retries):
+            try:
+                r = requests.post(url, headers=headers, json=body, timeout=REQUEST_TIMEOUT)
+                if r.status_code == 429:
+                    last = f"{model}: 429 rate-limited"
+                    time.sleep(min(30, 2 ** attempt))
+                    continue
+                if not r.ok:
+                    last = f"{model}: HTTP {r.status_code} {r.text[:140]}"
+                    break  # 다음 모델로
+                data = r.json()
+                cand = (data.get("candidates") or [{}])[0]
+                parts = (cand.get("content") or {}).get("parts") or []
+                texts = [p.get("text", "") for p in parts if p.get("text")]
+                if texts:
+                    return "".join(texts), None
+                last = f"{model}: no text (finishReason={cand.get('finishReason')})"
+                break  # 빈 응답 -> 다음 모델로
+            except Exception as exc:
+                last = f"{model}: {exc}"
+                time.sleep(2 ** attempt)
+    return None, last
 
 
 def summarize(topic, lang, articles):
-    headlines = "\n".join(f"- {a['title']}" for a in articles if a["title"])
-    if not headlines:
-        return None
+    titled = [a for a in articles if a.get("title")]
+    if not titled:
+        return f"[진단] 기사 {len(articles)}건을 받았지만 제목이 비어 있어 요약 불가 (RSS 파싱 문제)"
+    headlines = "\n".join(f"- {a['title']}" for a in titled)
     lang_name = "Korean" if lang == "ko" else "English"
     prompt = (
         f"You are a tech/finance news editor. Below are recent news headlines about "
@@ -102,9 +107,9 @@ def summarize(topic, lang, articles):
         f"- 3-5 short sentences. Synthesize; do not copy headlines verbatim.\n\n"
         f"Headlines:\n{headlines}"
     )
-    text = call_gemini(prompt)
+    text, err = call_gemini(prompt)
     if not text:
-        return None
+        return f"[진단] 요약 실패: {err}"
     text = text.strip()
     if len(text) > CHAR_LIMIT:
         text = text[:CHAR_LIMIT].rsplit(" ", 1)[0].rstrip() + "…"
@@ -182,9 +187,10 @@ def main():
         print(f"Processing: {topic}")
         en_articles = fetch_articles(gnews_url(en_q, "en"), ARTICLES_PER_FEED)
         ko_articles = fetch_articles(gnews_url(ko_q, "ko"), ARTICLES_PER_FEED)
-        all_articles = en_articles + ko_articles          # 영문+국문 기사를 합쳐서 요약
-        en_sum = summarize(topic, "en", all_articles) or "No recent articles found."
-        ko_sum = summarize(topic, "ko", all_articles) or "최근 기사를 찾지 못했습니다."
+        print(f"  fetched: en={len(en_articles)} ko={len(ko_articles)}")
+        all_articles = en_articles + ko_articles
+        en_sum = summarize(topic, "en", all_articles)
+        ko_sum = summarize(topic, "ko", all_articles)
         links = [a["link"] for a in (en_articles[:2] + ko_articles[:2]) if a["link"]]
         sections.append(build_topic_html(topic, emoji, en_sum, ko_sum, links))
         time.sleep(1)
